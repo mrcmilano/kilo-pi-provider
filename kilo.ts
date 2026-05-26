@@ -287,8 +287,8 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
     Math.ceil(m.context_length * 0.2);
 
   return {
-    id: m.id,
-    name: m.name,
+    id: sanitizeForTerminal(m.id),
+    name: sanitizeForTerminal(m.name),
     reasoning: supportsReasoning,
     input: supportsImages ? ["text", "image"] : ["text"],
     cost: {
@@ -343,6 +343,19 @@ async function fetchKiloModels(options?: {
     .map(mapOpenRouterModel);
 }
 
+/**
+ * Strip ANSI escape sequences and non-printable control characters from
+ * strings rendered in the terminal, preventing API responses from injecting
+ * escape codes into the TUI.
+ */
+function sanitizeForTerminal(value: string): string {
+  return value
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")   // CSI sequences
+    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "") // OSC sequences
+    .replace(/\x1b[^[\]]/g, "")               // other ESC sequences
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ""); // C0/C1 controls except tab
+}
+
 // =============================================================================
 // Provider Config
 // =============================================================================
@@ -362,6 +375,14 @@ const KILO_PROVIDER_CONFIG = {
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
+  if (process.env.KILO_API_URL) {
+    console.warn(
+      `[kilo] WARNING: KILO_API_URL is set to "${process.env.KILO_API_URL}". ` +
+      `All traffic including auth tokens will be sent to this endpoint. ` +
+      `Unset KILO_API_URL to use the default https://api.kilo.ai`,
+    );
+  }
+
   // Fetch free models at load time so the provider is immediately usable.
   let freeModels: ProviderModelConfig[] = [];
   try {
@@ -429,38 +450,14 @@ export default async function (pi: ExtensionAPI) {
     oauth: makeOAuthConfig(),
   });
 
-  // After session starts, pre-fetch all models if already logged in so
-  // modifyModels has data to work with. Also fetch and display credits.
-  pi.on("session_start", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-
-    // Clear credits if not logged in
-    if (cred?.type !== "oauth") {
-      ctx.ui.setStatus("kilo-credits", undefined);
-      return;
-    }
-
+  const BALANCE_THROTTLE_MS = 5 * 60 * 1000;
+  let lastBalanceFetch = 0;
+  async function maybeRefreshBalance(token: string, ctx: any): Promise<void> {
+    const now = Date.now();
+    if (now - lastBalanceFetch < BALANCE_THROTTLE_MS) return;
+    lastBalanceFetch = now;
     try {
-      cachedAllModels = await fetchKiloModels({ token: cred.access });
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch models at session start:",
-        error instanceof Error ? error.message : error,
-      );
-      return;
-    }
-    if (cachedAllModels.length > 0) {
-      // Re-register to trigger modifyModels with the cached data.
-      ctx.modelRegistry.registerProvider("kilo", {
-        ...KILO_PROVIDER_CONFIG,
-        models: freeModels,
-        oauth: makeOAuthConfig(),
-      });
-    }
-
-    // Fetch and display credits balance
-    try {
-      const balance = await fetchKiloBalance(cred.access);
+      const balance = await fetchKiloBalance(token);
       if (balance !== null) {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
@@ -474,6 +471,43 @@ export default async function (pi: ExtensionAPI) {
         error instanceof Error ? error.message : error,
       );
     }
+  }
+
+  // After session starts, pre-fetch all models if already logged in so
+  // modifyModels has data to work with. Also fetch and display credits.
+  pi.on("session_start", async (_event, ctx) => {
+    const cred = ctx.modelRegistry.authStorage.get("kilo");
+    const apiKeyToken = process.env.KILO_API_KEY;
+    const oauthToken = cred?.type === "oauth" ? cred.access : undefined;
+    const activeToken = apiKeyToken ?? oauthToken;
+
+    if (!activeToken) {
+      ctx.ui.setStatus("kilo-credits", undefined);
+      return;
+    }
+
+    // Model list upgrade requires OAuth; skip when authenticating via API key only.
+    if (oauthToken) {
+      try {
+        cachedAllModels = await fetchKiloModels({ token: oauthToken });
+      } catch (error) {
+        console.warn(
+          "[kilo] Failed to fetch models at session start:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+
+      if (cachedAllModels.length > 0) {
+        // Re-register to trigger modifyModels with the cached data.
+        ctx.modelRegistry.registerProvider("kilo", {
+          ...KILO_PROVIDER_CONFIG,
+          models: freeModels,
+          oauth: makeOAuthConfig(),
+        });
+      }
+    }
+
+    await maybeRefreshBalance(activeToken, ctx);
   });
 
   // Update credits display when model changes to a Kilo model
@@ -481,45 +515,12 @@ export default async function (pi: ExtensionAPI) {
     if (event.model?.provider !== "kilo") return;
 
     const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
+    const apiKeyToken = process.env.KILO_API_KEY;
+    const oauthToken = cred?.type === "oauth" ? cred.access : undefined;
+    const activeToken = apiKeyToken ?? oauthToken;
+    if (!activeToken) return;
 
-    try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
-        const theme = ctx.ui.theme;
-        ctx.ui.setStatus(
-          "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
-        );
-      }
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch balance on model select:",
-        error instanceof Error ? error.message : error,
-      );
-    }
-  });
-
-  // Refresh credits after each turn
-  pi.on("turn_end", async (_event, ctx) => {
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type !== "oauth") return;
-
-    try {
-      const balance = await fetchKiloBalance(cred.access);
-      if (balance !== null) {
-        const theme = ctx.ui.theme;
-        ctx.ui.setStatus(
-          "kilo-credits",
-          theme.fg("accent", `💰 ${formatCredits(balance)}`),
-        );
-      }
-    } catch (error) {
-      console.warn(
-        "[kilo] Failed to fetch balance on turn end:",
-        error instanceof Error ? error.message : error,
-      );
-    }
+    await maybeRefreshBalance(activeToken, ctx);
   });
 
   // On first use of a Kilo model without login, print ToS notice.
