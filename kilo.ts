@@ -28,7 +28,6 @@ const KILO_DEVICE_AUTH_ENDPOINT = `${KILO_API_BASE}/api/device-auth/codes`;
 const POLL_INTERVAL_MS = 3000;
 const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const TOKEN_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
-const KILO_TOS_URL = "https://kilo.ai/terms";
 const KILO_PROFILE_ENDPOINT = `${KILO_API_BASE}/api/profile`;
 
 // =============================================================================
@@ -538,30 +537,6 @@ export default async function (pi: ExtensionAPI) {
     if (!activeToken) return;
 
     await maybeRefreshBalance(activeToken, ctx);
-  });
-
-  // On first use of a Kilo model without login, print ToS notice.
-  let tosShown = false;
-
-  pi.on("before_agent_start", async (_event, ctx) => {
-    if (tosShown) return;
-    if (ctx.model?.provider !== "kilo") return;
-
-    const cred = ctx.modelRegistry.authStorage.get("kilo");
-    if (cred?.type === "oauth") {
-      tosShown = true;
-      return;
-    }
-
-    tosShown = true;
-
-    return {
-      message: {
-        customType: "kilo",
-        content: `By using Kilo, you agree to the Terms of Service: ${KILO_TOS_URL}`,
-        display: true,
-      },
-    };
   });
 
   // Use custom footer to show credits inline with token stats
