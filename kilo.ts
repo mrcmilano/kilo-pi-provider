@@ -486,7 +486,7 @@ export default async function (pi: ExtensionAPI) {
       return;
     }
 
-    // Model list upgrade requires OAuth; skip when authenticating via API key only.
+    // Full model list upgrade: OAuth uses modifyModels, API key registers directly.
     if (oauthToken) {
       try {
         cachedAllModels = await fetchKiloModels({ token: oauthToken });
@@ -504,6 +504,23 @@ export default async function (pi: ExtensionAPI) {
           models: freeModels,
           oauth: makeOAuthConfig(),
         });
+      }
+    } else if (apiKeyToken) {
+      try {
+        const allModels = await fetchKiloModels({ token: apiKeyToken });
+        if (allModels.length > 0) {
+          // Register full model list directly (no modifyModels without OAuth).
+          ctx.modelRegistry.registerProvider("kilo", {
+            ...KILO_PROVIDER_CONFIG,
+            models: allModels,
+            oauth: makeOAuthConfig(),
+          });
+        }
+      } catch (error) {
+        console.warn(
+          "[kilo] Failed to fetch models via API key:",
+          error instanceof Error ? error.message : error,
+        );
       }
     }
 
