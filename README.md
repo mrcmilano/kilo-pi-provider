@@ -13,7 +13,7 @@ npm install -g @mariozechner/pi-coding-agent
 ## Installation
 
 ```bash
-pi install git:github.com/mrexodia/kilo-pi-provider
+pi install git:github.com/mrcmilano/kilo-pi-provider
 ```
 
 ## Usage
